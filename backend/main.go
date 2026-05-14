@@ -5,14 +5,27 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/rs/cors"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// Question represents a single test question
+type Question struct {
+	ID      primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TestID  string             `bson:"test_id" json:"test_id"`
+	Text    string             `bson:"text" json:"text"`
+	Options []string           `bson:"options" json:"options"`
+	Answer  int                `bson:"answer" json:"-"` // index 0-3; "-" means never send to frontend
+	Subject string             `bson:"subject" json:"subject"`
+}
 
 // User is the shape of a person using our platform
 type User struct {
@@ -114,6 +127,101 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// getTestQuestionsHandler returns questions for a given test ID (without answers)
+func getTestQuestionsHandler(w http.ResponseWriter, r *http.Request) {
+	// URL: /tests/{testId}/questions
+	parts := strings.Split(strings.TrimSuffix(r.URL.Path, "/"), "/")
+	if len(parts) != 4 || parts[2] == "" || parts[3] != "questions" {
+		http.NotFound(w, r)
+		return
+	}
+	testID := parts[2]
+
+	coll := client.Database("rayan_academy").Collection("questions")
+	cursor, err := coll.Find(r.Context(), bson.M{"test_id": testID})
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer cursor.Close(r.Context())
+
+	var questions []Question
+	if err = cursor.All(r.Context(), &questions); err != nil {
+		http.Error(w, "Error reading questions", http.StatusInternalServerError)
+		return
+	}
+
+	// Because of json:"-" tag, the Answer field is automatically omitted
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(questions)
+}
+
+// submitTestHandler accepts user answers, calculates score, and saves the attempt
+func submitTestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// URL: /tests/{testId}/submit
+	parts := strings.Split(strings.TrimSuffix(r.URL.Path, "/"), "/")
+	if len(parts) != 4 || parts[2] == "" || parts[3] != "submit" {
+		http.NotFound(w, r)
+		return
+	}
+	testID := parts[2]
+
+	// Parse the incoming answer list
+	var submission struct {
+		Answers []struct {
+			QuestionID string `json:"questionId"`
+			Selected   int    `json:"selected"`
+		} `json:"answers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&submission); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch the actual questions to get correct answers
+	coll := client.Database("rayan_academy").Collection("questions")
+	var questions []Question
+	cursor, err := coll.Find(r.Context(), bson.M{"test_id": testID})
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	if err = cursor.All(r.Context(), &questions); err != nil {
+		http.Error(w, "Error reading questions", http.StatusInternalServerError)
+		return
+	}
+
+	// Build a fast map of questionID -> correct answer
+	answerMap := make(map[string]int)
+	for _, q := range questions {
+		answerMap[q.ID.Hex()] = q.Answer
+	}
+
+	// Calculate score
+	score := 0
+	total := len(questions)
+	for _, ans := range submission.Answers {
+		if correct, exists := answerMap[ans.QuestionID]; exists && ans.Selected == correct {
+			score++
+		}
+	}
+	percentage := float64(score) / float64(total) * 100
+
+	// (Later we'll save the attempt to the user's history)
+
+	result := map[string]interface{}{
+		"score":      score,
+		"total":      total,
+		"percentage": percentage,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
 func main() {
 	// Connect to MongoDB
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -131,13 +239,26 @@ func main() {
 	}
 	log.Println("✅ Connected to MongoDB!")
 
-	// 1. Set up your Routes
+	// 1. Set up your Routes (using mux)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/signup", signupHandler)
 	mux.HandleFunc("/login", loginHandler)
 
-	// 2. Set up CORS Configuration
+	// 2. Add the /tests/ route (with sub-routing logic)
+	// I have wrapped this in authMiddleware so only logged-in users can take tests
+	mux.HandleFunc("/tests/", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		// Simple sub-router:
+		if strings.HasSuffix(r.URL.Path, "/questions") && r.Method == http.MethodGet {
+			getTestQuestionsHandler(w, r)
+		} else if strings.HasSuffix(r.URL.Path, "/submit") && r.Method == http.MethodPost {
+			submitTestHandler(w, r)
+		} else {
+			http.NotFound(w, r)
+		}
+	}))
+
+	// 3. Set up CORS Configuration
 	// This allows your React frontend (localhost:5173) to talk to this backend
 	corsHandler := cors.New(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:5173"},
@@ -146,10 +267,10 @@ func main() {
 		AllowedHeaders:   []string{"Content-Type", "Authorization"},
 	})
 
-	// 3. Wrap the router (mux) with the CORS handler
+	// 4. Wrap the mux with the CORS handler
 	handler := corsHandler.Handler(mux)
 
-	// 4. Start server using the wrapped handler
+	// 5. Start server
 	log.Println("🚀 Rayan Academy backend running on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", handler))
 }
