@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/rs/cors"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
@@ -130,16 +131,27 @@ func main() {
 	}
 	log.Println("✅ Connected to MongoDB!")
 
-	// Routes
-	http.HandleFunc("/health", healthHandler)
+	// 1. Set up your Routes
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/signup", signupHandler)
+	mux.HandleFunc("/login", loginHandler)
 
-	http.HandleFunc("/signup", signupHandler)
+	// 2. Set up CORS Configuration
+	// This allows your React frontend (localhost:5173) to talk to this backend
+	corsHandler := cors.New(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:5173"},
+		AllowCredentials: true,
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+	})
 
-	http.HandleFunc("/login", loginHandler)
+	// 3. Wrap the router (mux) with the CORS handler
+	handler := corsHandler.Handler(mux)
 
-	// Start server
+	// 4. Start server using the wrapped handler
 	log.Println("🚀 Rayan Academy backend running on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8080", handler))
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
